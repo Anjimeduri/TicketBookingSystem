@@ -3,7 +3,6 @@ package org.tbs.entity;
 import lombok.Getter;
 import lombok.Setter;
 import org.tbs.enums.SeatType;
-import org.tbs.utils.IdGenerator;
 
 import java.math.BigDecimal;
 import java.util.HashMap;
@@ -23,7 +22,6 @@ public class Venue extends BaseClass {
         this.name = name;
         this.location = location;
         this.isActive = isActive;
-        this.setId(IdGenerator.generateSequence(this.getClass()));
         registerSeats(rows, cols);
     }
 

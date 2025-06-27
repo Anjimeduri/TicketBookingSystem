@@ -8,6 +8,7 @@ import org.tbs.enums.SeatStatus;
 import org.tbs.exceptions.NotAvailableException;
 import org.tbs.exceptions.PaymentFailedException;
 import org.tbs.factory.NotificationFactory;
+import org.tbs.repository.BookingRepository;
 import org.tbs.services.serviceInterfaces.IBookingService;
 import org.tbs.services.serviceInterfaces.IShowService;
 import org.tbs.services.serviceInterfaces.IUserService;
@@ -18,19 +19,21 @@ import java.time.LocalDate;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.Optional;
 
 @Slf4j
-public class BookingService implements IBookingService {
+public class BookingService extends BaseService<Booking> implements IBookingService {
     private final NotificationFactory notificationFactory;
-    // Dependency on abstraction not on concrete.This gives easy way to switch to diff implementation
+
+    // Dependency on abstraction class and not on concrete.This gives easy way to switch to diff implementation
     private final IVenueService venueService;
     private final IShowService showService;
     private final IUserService userService;
     private final PaymentService paymentService;
-    private final Map<Long, Booking> bookingMap = new ConcurrentHashMap<>();
 
-    public BookingService(IVenueService venueService, IShowService showService, IUserService userService, NotificationFactory notificationFactory, PaymentService paymentService) {
+    public BookingService(BookingRepository bookingRepository, IVenueService venueService, IShowService showService,
+                          IUserService userService, NotificationFactory notificationFactory, PaymentService paymentService) {
+        super(bookingRepository);
         this.venueService = venueService;
         this.showService = showService;
         this.userService = userService;
@@ -39,71 +42,68 @@ public class BookingService implements IBookingService {
     }
 
     @Override
-    public synchronized Booking book(Long userId, Long showId, LocalDate bookingDate, List<Long> seatIds) {
-        Objects.requireNonNull(seatIds);
-        if (seatIds.isEmpty()) {
+    public synchronized Booking create(Booking request) {
+        Objects.requireNonNull(request, "request object cant be empty");
+        Objects.requireNonNull(request.getSeatIds());
+        if (request.getSeatIds().isEmpty()) {
             log.error("At least one seat should be selected to book");
             throw new IllegalArgumentException("At least one seat should be selected to book");
         }
 
-        User user = userService.findById(userId);
-        Show show = showService.findById(showId);
+        User user = userService.findById(request.getUserId());
+        Show show = showService.findById(request.getShowId());
         Venue venue = venueService.findById(show.getVenueId());
 
-        Booking booking = processBooking(user, show, venue, bookingDate, seatIds);
-        return finalizeBooking(booking, userId);
+        Booking booking = processBooking(user, show, venue, request.getBookingDate(), request.getSeatIds());
+        return finalizeBooking(booking, request.getUserId());
     }
 
-    @Override
     public synchronized void cancelBooking(Long bookingId) {
         log.info("Cancelling booking {}", bookingId);
-        if (!bookingMap.containsKey(bookingId)) {
+        Optional<Booking> booking = getRepository().findById(bookingId);
+        if (booking.isEmpty()) {
             throw new IllegalArgumentException("Booking id not found");
         }
-        Booking booking = bookingMap.get(bookingId);
-        booking.updateBookingStatus(BookingStatus.CANCELLED);
-        processBookingCancellation(booking);
+        booking.get().updateBookingStatus(BookingStatus.CANCELLED);
+        processBookingCancellation(booking.get());
     }
 
-    @Override
-    public void updateBooking() {
-
-    }
-
-    @Override
-    public Booking findById(Long id) {
-        if (!bookingMap.containsKey(id)) {
-            throw new IllegalArgumentException("Booking not found with the provided ID");
-        }
-        return bookingMap.get(id);
-    }
-
-    public synchronized Booking processBooking(User user, Show show, Venue venue, LocalDate bookingDate, List<Long> seatIds) {
+    private synchronized Booking processBooking(User user, Show show, Venue venue, LocalDate bookingDate, List<Long> seatIds) {
         Map<Long, Seat> venueSeatMapping = venue.getSeatMap();
         BigDecimal amount = BigDecimal.ZERO;
 
-        seatIds.forEach(seatId -> {
+        for (Long seatId : seatIds) {
             Seat seat = venueSeatMapping.get(seatId);
             if (seat.getStatus() != SeatStatus.AVAILABLE) {
-                throw new NotAvailableException("Sorry this seat has been booked already please try some other seats");
+                throw new NotAvailableException("Sorry, this seat has already been booked. Please try other seats.");
             }
             seat.setStatus(SeatStatus.BLOCKED);
-            amount.add(seat.getPrice());
-        });
-        log.info("Creating a booking entry for  -> user id {} with amount {}", user.getId(), amount);
+            amount = amount.add(seat.getPrice());
+        }
+        log.info("Creating a booking entry for user id {} with amount {}", user.getId(), amount);
 
-        return new Booking(show.getId(), user.getId(), bookingDate, seatIds, amount);
+        Booking bookingDetails = Booking.builder()
+                .userId(user.getId())
+                .showId(show.getId())
+                .bookingDate(bookingDate)
+                .seatIds(seatIds)
+                .amount(amount)
+                .status(BookingStatus.RESERVED)
+                .build();
+        Booking booking = getRepository().save(bookingDetails);
+        log.info("created a booking entry for  -> user id {} with amount {} and booking id is {}", booking.getUserId(), amount, booking.getId());
+        return booking;
     }
 
-    public void processBookingCancellation(Booking booking) {
-        updateSeatStatus(booking.getShowId(), booking.getSeats(), SeatStatus.AVAILABLE);
+    private void processBookingCancellation(Booking booking) {
+        updateSeatStatus(booking.getShowId(), booking.getSeatIds(), SeatStatus.AVAILABLE);
         log.info("Seats updated to available");
-        bookingMap.remove(booking.getId());
+        getRepository().delete(booking.getId());
         notificationFactory.sendNotification(NotificationType.SMS, booking.getUserId());
         notificationFactory.sendNotification(NotificationType.EMAIL, booking.getUserId());
     }
 
-    public Booking finalizeBooking(Booking booking, Long userId) {
+    private Booking finalizeBooking(Booking booking, Long userId) {
         try {
             boolean processed = paymentService.processPayment(booking.getId());
             if (processed) {
@@ -121,20 +121,20 @@ public class BookingService implements IBookingService {
         }
     }
 
-    public void confirmBooking(Booking booking) {
+    private void confirmBooking(Booking booking) {
         booking.updateBookingStatus(BookingStatus.SUCCESS);
-        bookingMap.put(booking.getId(), booking);
-        updateSeatStatus(booking.getShowId(), booking.getSeats(), SeatStatus.BOOKED);
+        getRepository().update(booking);
+        updateSeatStatus(booking.getShowId(), booking.getSeatIds(), SeatStatus.BOOKED);
 
     }
 
-    public void rollBackBooking(Booking booking) {
+    private void rollBackBooking(Booking booking) {
         booking.updateBookingStatus(BookingStatus.FAILED);
-        bookingMap.remove(booking.getId());
-        updateSeatStatus(booking.getShowId(), booking.getSeats(), SeatStatus.AVAILABLE);
+        getRepository().delete(booking.getId());
+        updateSeatStatus(booking.getShowId(), booking.getSeatIds(), SeatStatus.AVAILABLE);
     }
 
-    public void updateSeatStatus(Long showId, List<Long> seatIds, SeatStatus seatStatus) {
+    private void updateSeatStatus(Long showId, List<Long> seatIds, SeatStatus seatStatus) {
         Show show = showService.findById(showId);
         Venue venue = venueService.findById(show.getVenueId());
         Map<Long, Seat> seatMapping = venue.getSeatMap();
